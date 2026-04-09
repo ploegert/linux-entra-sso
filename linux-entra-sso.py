@@ -8,19 +8,30 @@
 # pylint: enable=invalid-name
 
 import argparse
+import base64
 import ctypes
 import json
 import struct
 import sys
+import time
 import uuid
 from enum import Enum
 from signal import SIGINT
 from threading import RLock, Thread
 from xml.etree import ElementTree as ET
 
-from gi.repository import GLib
-from pydbus import SessionBus
-from pydbus.proxy import CompositeInterface
+import msal
+
+# pydbus and GLib are still required for PRT SSO cookie acquisition and
+# broker state monitoring via D-Bus NameOwnerChanged events, because
+# acquirePrtSsoCookie has no equivalent in the MSAL Python public API.
+try:
+    from gi.repository import GLib
+    from pydbus import SessionBus
+    from pydbus.proxy import CompositeInterface
+    _PYDBUS_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _PYDBUS_AVAILABLE = False
 
 # version is replaced on installation
 LINUX_ENTRA_SSO_VERSION = "0.0.0-dev"
@@ -37,25 +48,14 @@ START_REPLY_ALREADY_RUNNING = 2
 # prctl constants
 PR_SET_PDEATHSIG = 1
 
-# stripped down version of the broker dbus interface,
-# as brokers > 2.0.1 do not implement introspection
+# D-Bus spec limited to the methods still needed after the MSAL migration:
+# acquirePrtSsoCookie (no MSAL equivalent) and getLinuxBrokerVersion.
+# acquireTokenSilently and getAccounts are now handled by MSAL Python.
 BROKER_DBUS_SPEC = r"""<!DOCTYPE node PUBLIC
 "-//freedesktop//DTD D-Bus Object Introspection 1.0//EN"
 "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
 <node name="/com/microsoft/identity/broker1">
  <interface name="com.microsoft.identity.Broker1">
-  <method name="acquireTokenSilently" >
-   <arg type="s" direction="in"/>
-   <arg type="s" direction="in"/>
-   <arg type="s" direction="in"/>
-   <arg type="s" direction="out"/>
-  </method>
-  <method name="getAccounts" >
-   <arg type="s" direction="in"/>
-   <arg type="s" direction="in"/>
-   <arg type="s" direction="in"/>
-   <arg type="s" direction="out"/>
-  </method>
   <method name="acquirePrtSsoCookie" >
    <arg type="s" direction="in"/>
    <arg type="s" direction="in"/>
@@ -74,11 +74,10 @@ BROKER_DBUS_SPEC = r"""<!DOCTYPE node PUBLIC
 
 
 class AuthorizationType(Enum):
-    CACHED_REFRESH_TOKEN = (1,)
     PRT_SSO_COOKIE = (8,)
 
 
-class NativeMessaging:
+class NativeMessaging:  # pragma: no cover
     @staticmethod
     def get_message():
         """
@@ -116,26 +115,70 @@ class SsoMib:
     BROKER_NAME = "com.microsoft.identity.broker1"
     BROKER_PATH = "/com/microsoft/identity/broker1"
     GRAPH_SCOPES = ["https://graph.microsoft.com/.default"]
+    MSAL_AUTHORITY = "https://login.microsoftonline.com/common"
+    MSAL_REDIRECT_URI = "https://login.microsoftonline.com/common/oauth2/nativeclient"
 
     def __init__(self, daemon=False):
-        self._bus = SessionBus()
-        self.broker = None
-        self.session_id = uuid.uuid4()
+        # Initialize MSAL PublicClientApplication with Linux broker support.
+        # MSAL handles get_accounts and acquire_token_silently internally via
+        # the microsoft-identity-broker daemon (same underlying service as D-Bus).
+        self._msal_app = msal.PublicClientApplication(
+            EDGE_BROWSER_CLIENT_ID,
+            authority=self.MSAL_AUTHORITY,
+            enable_broker_on_linux=True,
+        )
+        self._session_id = uuid.uuid4()
         self._state_changed_cb = None
         self._last_state_reported = False
-        if daemon:
-            self._introspect_broker()
-            self._monitor_bus()
 
-    def _introspect_broker(self):
+        # `broker` is a truthy indicator of broker availability, preserving
+        # the original interface expected by run_as_native_messaging().
+        # MSAL sets _enable_broker=True only when the broker package is installed
+        # and the broker daemon is reachable.
+        self.broker = self._msal_app._enable_broker or None
+
+        # D-Bus connection retained only for:
+        #   • acquirePrtSsoCookie  (no MSAL equivalent)
+        #   • getLinuxBrokerVersion
+        #   • NameOwnerChanged event (broker online/offline notifications)
+        self._dbus_bus = None
+        self._dbus_broker = None
+
+        if daemon:
+            if _PYDBUS_AVAILABLE:
+                try:
+                    self._dbus_bus = SessionBus()
+                    self._introspect_dbus_broker()
+                    self._monitor_bus()
+                except Exception as exc:  # pylint: disable=broad-except
+                    print(
+                        f"D-Bus setup failed ({exc}). "
+                        "PRT SSO cookies and broker version will be unavailable.",
+                        file=sys.stderr,
+                    )
+            else:
+                print(
+                    "pydbus/GLib not available. PRT SSO cookies, broker version "
+                    "queries, and broker state change events will be unavailable.",
+                    file=sys.stderr,
+                )
+            self._report_state_change()
+
+    # ------------------------------------------------------------------
+    # D-Bus helpers – state monitoring and PRT SSO cookie only
+    # ------------------------------------------------------------------
+
+    def _introspect_dbus_broker(self):
         introspection = ET.fromstring(BROKER_DBUS_SPEC)
-        self.broker = CompositeInterface(introspection)(
-            self._bus, self.BROKER_NAME, self.BROKER_PATH
+        self._dbus_broker = CompositeInterface(introspection)(
+            self._dbus_bus, self.BROKER_NAME, self.BROKER_PATH
         )
+        # Available if either MSAL enabled the broker or D-Bus connected
+        self.broker = self._msal_app._enable_broker or self._dbus_broker
         self._report_state_change()
 
     def _monitor_bus(self):
-        self._bus.subscribe(
+        self._dbus_bus.subscribe(
             sender="org.freedesktop.DBus",
             object="/org/freedesktop/DBus",
             signal="NameOwnerChanged",
@@ -150,11 +193,10 @@ class SsoMib:
         # params = (name, old_owner, new_owner)
         new_owner = params[2]
         if new_owner:
-            self._introspect_broker()
+            self._introspect_dbus_broker()
         else:
-            # we need to ensure that the next dbus call will
-            # wait until the broker is fully initialized again
-            self.broker = None
+            self._dbus_broker = None
+            self.broker = self._msal_app._enable_broker or None
             self._report_state_change()
 
     def _report_state_change(self):
@@ -171,80 +213,194 @@ class SsoMib:
         """
         self._state_changed_cb = callback
 
+    # ------------------------------------------------------------------
+    # Account format helpers
+    # ------------------------------------------------------------------
+
     @staticmethod
-    def _get_auth_parameters(account, scopes, sso_url=None):
-        params = {
-            "account": account,
-            "additionalQueryParametersForAuthorization": {},
-            "authority": "https://login.microsoftonline.com/common",
-            "authorizationType": (
-                AuthorizationType.PRT_SSO_COOKIE.value[0]
-                if sso_url
-                else AuthorizationType.CACHED_REFRESH_TOKEN.value[0]
-            ),
-            "clientId": EDGE_BROWSER_CLIENT_ID,
-            "redirectUri": "https://login.microsoftonline.com"
-            "/common/oauth2/nativeclient",
-            "requestedScopes": scopes,
-            "username": account["username"],
-            "uxContextHandle": -1,
+    def _msal_account_to_broker(msal_account):
+        """Convert an MSAL account dict to the broker format expected by the JS extension.
+
+        MSAL returns accounts with snake_case keys; the extension expects camelCase
+        keys matching the Microsoft Identity Broker D-Bus response schema.
+        """
+        username = msal_account.get("username", "")
+        home_account_id = msal_account.get("home_account_id", "")
+        local_account_id = msal_account.get("local_account_id", "")
+        realm = msal_account.get("realm", "")
+
+        # Derive `clientInfo` – a base64url-encoded JSON blob {"uid": ..., "utid": ...}
+        # from the home_account_id which has the format "uid.utid" in MSAL.
+        parts = home_account_id.split(".", 1)
+        uid = parts[0] if parts else local_account_id
+        utid = parts[1] if len(parts) > 1 else realm
+        client_info_bytes = json.dumps(
+            {"uid": uid, "utid": utid}, separators=(",", ":")
+        ).encode()
+        client_info = base64.urlsafe_b64encode(client_info_bytes).rstrip(b"=").decode()
+
+        return {
+            # MSAL does not expose the user's display name; fall back to username.
+            "name": username,
+            "givenName": username,
+            "username": username,
+            "homeAccountId": home_account_id,
+            "localAccountId": local_account_id,
+            "clientInfo": client_info,
+            "realm": realm,
         }
-        if sso_url:
-            params["ssoUrl"] = sso_url
-        return params
+
+    def _find_msal_account(self, broker_account):
+        """Find the MSAL account object that corresponds to a broker-format account."""
+        username = broker_account.get("username", "")
+        home_account_id = broker_account.get("homeAccountId", "")
+
+        if username:
+            matches = self._msal_app.get_accounts(username=username)
+            if matches:
+                return matches[0]
+
+        # Fallback: linear search by home_account_id
+        if home_account_id:
+            for acc in self._msal_app.get_accounts():
+                if acc.get("home_account_id") == home_account_id:
+                    return acc
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def get_accounts(self):
-        self._introspect_broker()
-        context = {
-            "clientId": EDGE_BROWSER_CLIENT_ID,
-            "redirectUri": str(self.session_id),
+        """Return all accounts known to MSAL via the Linux broker."""
+        msal_accounts = self._msal_app.get_accounts()
+        return {
+            "accounts": [self._msal_account_to_broker(a) for a in msal_accounts]
         }
-        # pylint: disable=maybe-no-member
-        resp = self.broker.getAccounts("0.0", str(self.session_id), json.dumps(context))
-        return json.loads(resp)
-
-    def acquire_prt_sso_cookie(
-        self, account, sso_url, scopes=GRAPH_SCOPES
-    ):  # pylint: disable=dangerous-default-value
-        self._introspect_broker()
-        request = {
-            "account": account,
-            "authParameters": SsoMib._get_auth_parameters(account, scopes, sso_url),
-            "mamEnrollment": False,
-            "ssoUrl": sso_url,
-        }
-        # pylint: disable=maybe-no-member
-        token = json.loads(
-            self.broker.acquirePrtSsoCookie(
-                "0.0", str(self.session_id), json.dumps(request)
-            )
-        )
-        return token
 
     def acquire_token_silently(
         self, account, scopes=GRAPH_SCOPES
     ):  # pylint: disable=dangerous-default-value
-        self._introspect_broker()
-        request = {
-            "authParameters": SsoMib._get_auth_parameters(account, scopes),
+        """Acquire an access token silently via MSAL Python.
+
+        MSAL communicates with the microsoft-identity-broker daemon internally,
+        replacing the previous direct D-Bus acquireTokenSilently call.
+        """
+        msal_account = self._find_msal_account(account)
+        if msal_account is None:
+            return {
+                "brokerTokenResponse": {
+                    "error": "no_account",
+                    "error_description": (
+                        "No MSAL account found matching "
+                        f"username '{account.get('username', '')}'"
+                    ),
+                }
+            }
+
+        result = self._msal_app.acquire_token_silent(scopes, account=msal_account)
+
+        if result is None:
+            return {
+                "brokerTokenResponse": {
+                    "error": "no_token_in_cache",
+                    "error_description": (
+                        "No cached token available for the requested account and "
+                        "scopes. Interactive sign-in may be required."
+                    ),
+                }
+            }
+
+        if "error" in result:
+            return {"brokerTokenResponse": result}
+
+        now_ms = int(time.time() * 1000)
+        expires_on_ms = now_ms + result.get("expires_in", 3600) * 1000
+        ext_expires_on_ms = now_ms + result.get("ext_expires_in", 7200) * 1000
+        granted_scopes = result.get("scope", " ".join(scopes)).split()
+
+        return {
+            "brokerTokenResponse": {
+                "accessToken": result["access_token"],
+                "accessTokenType": 0,
+                "idToken": result.get("id_token", ""),
+                "account": account,
+                "clientInfo": account.get("clientInfo", ""),
+                "expiresOn": expires_on_ms,
+                "extendedExpiresOn": ext_expires_on_ms,
+                "grantedScopes": granted_scopes,
+            }
         }
-        # pylint: disable=maybe-no-member
+
+    def acquire_prt_sso_cookie(
+        self, account, sso_url, scopes=GRAPH_SCOPES
+    ):  # pylint: disable=dangerous-default-value
+        """Acquire a PRT SSO cookie via D-Bus.
+
+        The acquirePrtSsoCookie broker method is not part of the MSAL Python
+        public API, so the D-Bus interface is used directly here.
+        """
+        if not _PYDBUS_AVAILABLE:
+            raise RuntimeError(
+                "PRT SSO cookie acquisition requires pydbus and PyGObject. "
+                "Install them with:  pip install pydbus PyGObject  "
+                "or:  apt-get install python3-pydbus python3-gi"
+            )
+        if self._dbus_broker is None:
+            self._introspect_dbus_broker()
+
+        request = {
+            "account": account,
+            "authParameters": SsoMib._get_prt_auth_parameters(account, scopes, sso_url),
+            "mamEnrollment": False,
+            "ssoUrl": sso_url,
+        }
         token = json.loads(
-            self.broker.acquireTokenSilently(
-                "0.0", str(self.session_id), json.dumps(request)
+            self._dbus_broker.acquirePrtSsoCookie(  # pylint: disable=maybe-no-member
+                "0.0", str(self._session_id), json.dumps(request)
             )
         )
         return token
 
+    @staticmethod
+    def _get_prt_auth_parameters(account, scopes, sso_url):
+        return {
+            "account": account,
+            "additionalQueryParametersForAuthorization": {},
+            "authority": "https://login.microsoftonline.com/common",
+            "authorizationType": AuthorizationType.PRT_SSO_COOKIE.value[0],
+            "clientId": EDGE_BROWSER_CLIENT_ID,
+            "redirectUri": SsoMib.MSAL_REDIRECT_URI,
+            "requestedScopes": scopes,
+            "username": account["username"],
+            "uxContextHandle": -1,
+            "ssoUrl": sso_url,
+        }
+
     def get_broker_version(self):
-        self._introspect_broker()
-        params = json.dumps({"msalCppVersion": LINUX_ENTRA_SSO_VERSION})
-        # pylint: disable=maybe-no-member
-        resp = json.loads(
-            self.broker.getLinuxBrokerVersion("0.0", str(self.session_id), params)
-        )
-        resp["native"] = LINUX_ENTRA_SSO_VERSION
-        return resp
+        """Return version info for the native host, MSAL library, and identity broker."""
+        result = {
+            "native": LINUX_ENTRA_SSO_VERSION,
+            "msalVersion": getattr(msal, "__version__", "unknown"),
+        }
+
+        if _PYDBUS_AVAILABLE and self._dbus_broker is not None:
+            try:
+                params = json.dumps({"msalCppVersion": LINUX_ENTRA_SSO_VERSION})
+                resp = json.loads(
+                    self._dbus_broker.getLinuxBrokerVersion(  # pylint: disable=maybe-no-member
+                        "0.0", str(self._session_id), params
+                    )
+                )
+                result["linuxBrokerVersion"] = resp.get("linuxBrokerVersion")
+            except Exception as exc:  # pylint: disable=broad-except
+                print(
+                    f"Could not retrieve broker version via D-Bus: {exc}",
+                    file=sys.stderr,
+                )
+
+        return result
 
 
 def run_as_native_messaging():
@@ -276,10 +432,14 @@ def run_as_native_messaging():
             respond(cmd, ssomib.get_broker_version())
 
     def run_dbus_monitor():
-        # inform other side about initial state
+        # Inform the other side about the initial state.
         notify_state_change(bool(ssomib.broker))
-        loop = GLib.MainLoop()
-        loop.run()
+        # Run the GLib main loop only when pydbus is available; its event loop
+        # processes the D-Bus NameOwnerChanged subscription for broker
+        # online/offline notifications.  Without pydbus the main thread's
+        # while-loop below keeps the process alive.
+        if _PYDBUS_AVAILABLE:
+            GLib.MainLoop().run()
 
     def register_terminate_with_parent():
         libc = ctypes.CDLL("libc.so.6")
@@ -294,7 +454,7 @@ def run_as_native_messaging():
 
     ssomib = SsoMib(daemon=True)
     ssomib.on_broker_state_changed(notify_state_change)
-    monitor = Thread(target=run_dbus_monitor)
+    monitor = Thread(target=run_dbus_monitor, daemon=True)
     monitor.start()
     while True:
         received_message = NativeMessaging.get_message()
@@ -355,6 +515,12 @@ def run_interactive():
     monitor_mode = args.command == "monitor"
     ssomib = SsoMib(daemon=monitor_mode)
     if monitor_mode:
+        if not _PYDBUS_AVAILABLE:
+            print(
+                "error: 'monitor' command requires pydbus and PyGObject.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         print("Monitoring D-Bus for broker availability.")
         ssomib.on_broker_state_changed(
             lambda online: print(

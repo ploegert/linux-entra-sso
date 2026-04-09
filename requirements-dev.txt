@@ -1,0 +1,6 @@
+# Additional dependencies for running the mock native-messaging host
+# (tests/linux_entra_sso_mock.py) during browser extension development.
+#
+# Install: pip install -r requirements-dev.txt
+-r requirements.txt
+PyJWT>=2.0

@@ -23,11 +23,14 @@ The extension consists of two parts:
 
 ### Dependencies
 
-The extension requires [PyGObject](https://pygobject.gnome.org/) and [pydbus](https://github.com/LEW21/pydbus) as runtime dependencies.
+The extension requires [MSAL Python](https://github.com/AzureAD/microsoft-authentication-library-for-python) (with the `broker` extra) as well as [PyGObject](https://pygobject.gnome.org/) and [pydbus](https://github.com/LEW21/pydbus) as runtime dependencies.
 
-- On Debian: `sudo apt-get install python3-gi python3-pydbus`
-- On Arch Linux: `sudo pacman -S python-gobject python-pydbus`
-- If you are using a Python version manager such as `asdf` you must install the Python packages manually: `pip install PyGObject pydbus`
+MSAL Python (with `msal[broker]`) handles `getAccounts` and `acquireTokenSilently` by communicating with the Microsoft Identity Broker internally.  
+pydbus/PyGObject is still required for `acquirePrtSsoCookie` (browser SSO cookie injection) and broker state-change monitoring, which have no equivalent in the MSAL Python public API.
+
+- On Debian: `sudo apt-get install python3-gi python3-pydbus` and `pip install "msal[broker]>=1.33,<2"`
+- On Arch Linux: `sudo pacman -S python-gobject python-pydbus` and `pip install "msal[broker]>=1.33,<2"`
+- If you are using a Python version manager such as `asdf` you must install the Python packages manually: `pip install PyGObject pydbus "msal[broker]>=1.33,<2"`
 
 ### Installation of Host Tooling
 

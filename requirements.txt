@@ -1,0 +1,18 @@
+# Runtime dependencies for linux-entra-sso.py
+#
+# MSAL Python with the Linux broker extra is the primary dependency for
+# token acquisition.  It communicates with the microsoft-identity-broker
+# daemon under the hood, replacing the previous direct D-Bus calls for
+# acquireTokenSilently and getAccounts.
+msal[broker]>=1.33,<2
+
+# pydbus and PyGObject are still required for:
+#   • acquirePrtSsoCookie  – browser SSO cookie injection (no MSAL equivalent)
+#   • Broker state monitoring via D-Bus NameOwnerChanged events
+#
+# On Debian/Ubuntu these are best installed from the system package manager:
+#   sudo apt-get install python3-gi python3-pydbus
+# but can also be installed via pip when using a virtual environment or a
+# Python version manager (asdf, pyenv, etc.):
+pydbus
+PyGObject

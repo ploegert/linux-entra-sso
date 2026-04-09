@@ -18,17 +18,24 @@ les = importlib.import_module("linux-entra-sso")
 class SsoMibMock(les.SsoMib):
     """
     Implementation of the SsoMib without broker communication.
+
+    Overrides __init__ so that neither pydbus nor MSAL are initialised,
+    making the mock runnable on any platform without extra dependencies.
     """
 
     # random but stable
     MOCK_TENANT = "f52f0148-c8bb-4ee1-899b-8f93b0e4d63d"
 
     def __init__(self, daemon=False):  # pylint: disable=unused-argument
+        # Set only the attributes used by run_as_native_messaging /
+        # run_interactive; skip the real SsoMib.__init__ entirely so that
+        # neither pydbus nor msal are required at mock time.
         self.broker = True
+        self._state_changed_cb = None
 
     def on_broker_state_changed(self, callback):  # pylint: disable=unused-argument
         """
-        We do not implement state changes yet.
+        We do not implement state changes in the mock.
         """
 
     def get_accounts(self):
@@ -41,7 +48,7 @@ class SsoMibMock(les.SsoMib):
                     "name": "Account, Test (My Org Code)",
                     "givenName": "Account, Test (My Org Code)",
                     "username": "test.account@my-org.example.com",
-                    "homeAccountId": f"{self.MOCK_TENANT}-a975168d-a362-458b-af1c-a8982b1e8aac",
+                    "homeAccountId": f"{self.MOCK_TENANT}.a975168d-a362-458b-af1c-a8982b1e8aac",
                     "localAccountId": "a975168d-a362-458b-af1c-a8982b1e8aac",
                     "clientInfo": jwt.encode(
                         {"some": "payload"}, "secret", algorithm="HS256"
@@ -52,7 +59,7 @@ class SsoMibMock(les.SsoMib):
                     "name": "Account, Admin (My Org Code)",
                     "givenName": "Account, Admin (My Org Code)",
                     "username": "test.admin@my-org.example.com",
-                    "homeAccountId": f"{self.MOCK_TENANT}-2f205376-88f7-47a4-be93-8aa7cae8e4fa",
+                    "homeAccountId": f"{self.MOCK_TENANT}.2f205376-88f7-47a4-be93-8aa7cae8e4fa",
                     "localAccountId": "2f205376-88f7-47a4-be93-8aa7cae8e4fa",
                     "clientInfo": jwt.encode(
                         {"some": "payload"}, "secret", algorithm="HS256"
@@ -80,8 +87,9 @@ class SsoMibMock(les.SsoMib):
         self, account, scopes=les.SsoMib.GRAPH_SCOPES
     ):  # pylint: disable=dangerous-default-value
         """
-        Return a fake (invalid) token.
+        Return a fake (invalid) token in the format produced by the MSAL-based SsoMib.
         """
+        now_ms = int(time.time() * 1000)
         return {
             "brokerTokenResponse": {
                 "accessToken": jwt.encode(
@@ -93,8 +101,8 @@ class SsoMibMock(les.SsoMib):
                 ),
                 "account": account,
                 "clientInfo": account["clientInfo"],
-                "expiresOn": int(time.time() + 3600) * 1000,
-                "extendedExpiresOn": int(time.time() + 2 * 3600) * 1000,
+                "expiresOn": now_ms + 3600 * 1000,
+                "extendedExpiresOn": now_ms + 2 * 3600 * 1000,
                 "grantedScopes": scopes + ["profile"],
             }
         }
@@ -106,6 +114,7 @@ class SsoMibMock(les.SsoMib):
         return {
             "linuxBrokerVersion": "2.0.1-mock",
             "native": f"{les.LINUX_ENTRA_SSO_VERSION}-mock",
+            "msalVersion": "mock",
         }
 
 

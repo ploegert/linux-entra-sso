@@ -165,10 +165,13 @@ deb:
 		echo Priority: optional; \
 		echo 'Maintainer: Dr. Johann Pfefferl <johann.pfefferl@siemens.com>'; \
 		echo Installed-Size: `du --summarize $(DEBIAN_DESTDIR) | cut --fields=1`; \
-		echo 'Depends: python3-pydbus, python3-gi'; \
+		echo 'Depends: python3-pydbus, python3-gi, python3-pip'; \
 		echo Version: $(DEBIAN_PV); \
 		echo Description: $(DEBIAN_DESCRIPTION); \
 	} > $(DEBIAN_DESTDIR)/DEBIAN/control
+	printf '#!/bin/sh\nset -e\n# Install msal[broker] via pip: pymsalruntime (the broker extra) is not\n# available as an apt package and requires pip.\npip3 install --quiet --break-system-packages "msal[broker]>=1.33,<2"\n' \
+		> $(DEBIAN_DESTDIR)/DEBIAN/postinst
+	chmod 0755 $(DEBIAN_DESTDIR)/DEBIAN/postinst
 	install --mode 775 --directory $(DEBIAN_PKG_DIR)
 	dpkg-deb --deb-format=2.0 --root-owner-group --build $(DEBIAN_DESTDIR) $(DEBIAN_PKG_DIR)
 	@echo Package can be found here: $(DEBIAN_PKG_FILE)
